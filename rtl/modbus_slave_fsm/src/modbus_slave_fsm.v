@@ -24,13 +24,22 @@ module modbus_slave_fsm #(
   localparam STATE_EXECUTE    = 4'd8;
   localparam STATE_SEND       = 4'd9;
   localparam STATE_DONE       = 4'd10;
-  localparam STATE_EXEC_SETUP  = 4'd11;
+  localparam STATE_EXEC_RESP_SETUP  = 4'd11;
   localparam STATE_EXEC_COMMIT = 4'd12;
   localparam STATE_RESP_CRC    = 4'd13;
   localparam STATE_SEND_WAIT = 4'd14;
 
+  // Register types
+  localparam REGTYPE_HOLDING = 2'd2;
+
   // Exception Codes (need to check modbus spec for accuracy)
   localparam EXECPTION_ILLEGAL_FC = 8'h01;
+  localparam EXECPTION_ILLEGAL_HOLDING_REGISTER_ADDRESS = 2'd2;
+  localparam EXCEPTION_ILLEGAL_HOLDING_REGISTER_READ_PARAMS = 2'd3;
+
+  // Function Codes
+  localparam FC03 = 8'h03;
+  localparam FC06 = 8'h06;
 
 	// FSM
 	reg [3:0] fsm_state;						// Current state of the machine
@@ -212,12 +221,13 @@ module modbus_slave_fsm #(
         	end
       	end
 
+       	// Figure out FC
       	STATE_DECODE_FC: begin
       		fsm_fc <= fsm_frame_read_data;
 
        		case (fsm_frame_read_data)
         		// Only FC03 and FC06 for now, later expand
-       			8'h03, 8'h06: begin
+       			FC03, FC06: begin
          			fsm_frame_read_addr <= 2;
            		fsm_field_idx <= 0;
             	fsm_state <= STATE_FETCH_FIELDS;
@@ -230,7 +240,7 @@ module modbus_slave_fsm #(
         	endcase
       	end
 
-      	// Needs to handle longer fields for other function codes
+      	// Needs to handle longer fields for other function codes (handle later)
       	STATE_FETCH_FIELDS: begin
       		fsm_field_buf[fsm_field_idx] <= fsm_frame_read_data;
        		fsm_frame_read_addr <= fsm_frame_read_addr + 1;
@@ -240,15 +250,28 @@ module modbus_slave_fsm #(
         	end
       	end
 
+       	// Decode requests
       	STATE_EXECUTE: begin
        		case (fsm_fc)
-         		// 8'h06: begin
+         		// FC06: Write Single Holding Register
+       			FC06: begin
+          		rb_regtype <= REGTYPE_HOLDING;
+            	rb_addr <= {fsm_field_buf[0], fsm_field_buf[1]};
+             	rb_wdata <= {fsm_field_buf[2], fsm_field_buf[3]};
+            	fsm_state <= STATE_EXEC_RESP_SETUP;
+           	end
 
-           	// end
+            // FC03: Read Multiple Holding Registers
+            FC03: begin
+            	rb_regtype <= REGTYPE_HOLDING;
+             	rb_addr <= {fsm_field_buf[0], fsm_field_buf[1]};
+              fsm_state <= STATE_EXEC_RESP_SETUP;
+
+            end
+
             default: begin	// Unsupported FC
-            	// Build exception response
              	resp_buf[0] <= slave_addr;
-              resp_buf[1] <= fsm_fc + 8'h80;
+              resp_buf[1] <= fsm_fc | 8'h80;
               resp_buf[2] <= EXECPTION_ILLEGAL_FC;
               resp_len <= 3;
               crc_src <= 1;	// 1 => make crc from response buffer
@@ -256,8 +279,104 @@ module modbus_slave_fsm #(
               crcgen_crc_reg <= 16'hFFFF;
               fsm_state <= STATE_RESP_CRC;
             end
+
          	endcase
        	end
+
+        // Set-up response for valid requests
+        STATE_EXEC_RESP_SETUP: begin
+        	case (fsm_fc)
+         		// FC06: Write Multiple Holding Registers
+         		FC06: begin
+           		if (rb_addr_valid) begin
+           			rb_wen <= 1;	// Enable write only if regbank assures that address is valid
+               	resp_buf[0] <= slave_addr;
+                resp_buf[1] <= fsm_fc;
+                resp_buf[2] <= fsm_field_buf[0];
+                resp_buf[3] <= fsm_field_buf[1];
+                resp_buf[4] <= fsm_field_buf[2];
+                resp_buf[5] <= fsm_field_buf[3];
+                resp_len <= 6;
+                crc_src <= 1;
+                resp_crc_idx <= 0;
+                crcgen_crc_reg <= 16'hFFFF;
+                fsm_state <= STATE_RESP_CRC;
+             	end else begin
+              	// Illegal Holding Register address
+	             	resp_buf[0] <= slave_addr;
+	              resp_buf[1] <= fsm_fc | 8'h80;
+	              resp_buf[2] <= EXECPTION_ILLEGAL_HOLDING_REGISTER_ADDRESS;
+	              resp_len <= 3;
+	              crc_src <= 1;	// 1 => make crc from response buffer
+	              resp_crc_idx <= 0;	// Setup CRC calc byte index
+	              crcgen_crc_reg <= 16'hFFFF;
+	              fsm_state <= STATE_RESP_CRC;
+              end
+           	end
+
+            // FC03: Read Multiple Holding Registers
+            // Needs loop-state to commit
+            FC03: begin
+            	if (
+             		rb_addr_valid &&
+               	// Check start address valid
+             		({fsm_field_buf[2], fsm_field_buf[3]} >= 16'd1) &&
+               	({fsm_field_buf[2], fsm_field_buf[3]} <= 16'd125) &&
+                // Check range valid (start + qty < HOLDING_COUNT)
+                (rb_addr + {fsm_field_buf[2], fsm_field_buf[3]} - 1 < 16'd64)
+             ) begin
+             		// Build Response header
+              	resp_buf[0] <= slave_addr;
+                resp_buf[1] <= fsm_fc;
+                resp_buf[2] <= {fsm_field_buf[2], fsm_field_buf[3]} << 1;  				// byte_count = qty*2
+                resp_len    <= 3 + ({fsm_field_buf[2], fsm_field_buf[3]} << 1);  	// header + data
+                fsm_field_idx <= 0;   																						// reuse as reg_idx
+                fsm_state     <= STATE_EXEC_COMMIT;
+             end else begin
+             	// exception
+            	resp_buf[0] <= slave_addr;
+              resp_buf[1] <= FC03 | 8'h80;
+              resp_buf[2] <= 	EXCEPTION_ILLEGAL_HOLDING_REGISTER_READ_PARAMS;
+              resp_len    <= 3;
+              crc_src        <= 1;
+              resp_crc_idx   <= 0;
+              crcgen_crc_reg <= 16'hFFFF;
+              fsm_state      <= STATE_RESP_CRC;
+             end
+            end
+
+            // WHAT GOES HERE?
+            default: begin
+
+            end
+         	endcase
+        end
+
+        // Commit reads/writes for multiple registers (cannot finish in a single clock cycle)
+        STATE_EXEC_COMMIT: begin
+        	case (fsm_fc)
+         		FC03: begin
+           		// rb_addr was setup two clock cycles before, read and re-set
+             	resp_buf[3 + (fsm_field_idx << 1)] <= rb_rdata[15:8];
+              resp_buf[4 + (fsm_field_idx << 1)] <= rb_rdata[7:0];
+
+              if (fsm_field_idx == {fsm_field_buf[2], fsm_field_buf[3]} - 1) begin
+              	crc_src <= 1;
+               	resp_crc_idx <= 0;
+                crcgen_crc_reg <= 16'hFFFF;
+                fsm_state <= STATE_RESP_CRC;
+              end else begin
+              	fsm_field_idx <= fsm_field_idx + 1;
+               	rb_addr <= rb_addr + 1;
+              end
+           	end
+
+            // WHAT GOES HERE?
+            default: begin
+
+            end
+         	endcase
+        end
 
         STATE_RESP_CRC: begin
        		crcgen_crc_reg <=  crcgen_crc_out;
@@ -273,7 +392,6 @@ module modbus_slave_fsm #(
         end
 
         STATE_SEND: begin
-
         	if (resp_send_idx == resp_len) begin
          		fsm_state <= STATE_DONE;
          	end
