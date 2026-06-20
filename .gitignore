@@ -1,0 +1,4 @@
+rtl/crc16/build/
+rtl/frame_detector/build/
+rtl/modbus_slave_fsm/build/
+rtl/register_bank/build/
