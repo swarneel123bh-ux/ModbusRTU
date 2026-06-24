@@ -1,0 +1,12 @@
+{
+	"clk_freq": 1000000,
+	"baud_rate": 100000,
+	"max_retries": 2,
+	"slaves": [{ "addr": "0x11" }, { "addr": "0x12" }, { "addr": "0x13" }],
+	"errors": {
+		"enable": true,
+		"seed": "0xACE12345",
+		"rate_ppm": 2000,
+		"direction": "request"
+	}
+}
