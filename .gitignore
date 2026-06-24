@@ -3,3 +3,4 @@ rtl/frame_detector/build/
 rtl/modbus_slave_fsm/build/
 rtl/register_bank/build/
 rtl/modbus_master_fsm/build/
+sim/build/
